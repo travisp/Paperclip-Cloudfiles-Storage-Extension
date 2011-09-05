@@ -1,55 +1,58 @@
+require 'paperclip'
 module Paperclip
   module Storage
-    module S3
+    module Cloud_files
       def self.extended base
         begin
-          require 'aws/s3'
+          require 'cloudfiles'
         rescue LoadError => e
-          e.message << " (You may need to install the aws-s3 gem)"
+          e.message << " (You may need to install the cloudfiles gem)"
           raise e
-        end
-
+        end unless defined?(CloudFiles)
+        @@container ||= {}
         base.instance_eval do
-          @s3_credentials = parse_credentials(@options[:s3_credentials])
-          @bucket         = @options[:bucket]         || @s3_credentials[:bucket]
-          @bucket_alt     = @options[:bucket_alt]     || @s3_credentials[:bucket_alt]
-          @testing        = @options[:testing]        || @s3_credentials[:testing]
-          @bucket         = @bucket.call(self) if @bucket.is_a?(Proc)
-          @s3_options     = @options[:s3_options]     || {}
-          @s3_permissions = @options[:s3_permissions] || :public_read
-          @s3_protocol    = @options[:s3_protocol]    || (@s3_permissions == :public_read ? 'http' : 'https')
-          @s3_headers     = @options[:s3_headers]     || {}
-          @s3_host_alias  = @options[:s3_host_alias]
-          @url            = ":s3_path_url" unless @url.to_s.match(/^:s3.*url$/)
-          AWS::S3::Base.establish_connection!( @s3_options.merge(
-                                                                 :access_key_id => @s3_credentials[:access_key_id],
-                                                                 :secret_access_key => @s3_credentials[:secret_access_key]
-                                                                 ))
-        end
-        Paperclip.interpolates(:s3_alias_url) do |attachment, style|
-          "#{attachment.s3_protocol}://#{attachment.s3_host_alias}/#{attachment.path(style).gsub(%r{^/}, "")}"
+          @cloudfiles_credentials = parse_credentials(@options[:cloudfiles_credentials])
+          @container_name         = @options[:container] || options[:container_name] || @cloudfiles_credentials[:container] || @cloudfiles_credentials[:container_name]
+          @container_name         = @container_name.call(self) if @container_name.is_a?(Proc)
+          @alt_container_name     = @options[:alt_container] || options[:alt_container_name] || @cloudfiles_credentials[:alt_container] || @cloudfiles_credentials[:alt_container_name]
+          @alt_container_name     = @alt_container_name.call(self) if @alt_container_name.is_a?(Proc)
+          @testing                = @options[:testing]        || @cloudfiles_credentials[:testing]
+          @cloudfiles_options     = @options[:cloudfiles_options]     || {}
+          @@cdn_url               = @cloudfiles_credentials[:cname] || cloudfiles_container.cdn_url
+          @@ssl_url               = @cloudfiles_credentials[:cname] || cloudfiles_container.cdn_ssl_url
+          @@alt_url               = alt_cloudfiles_container.cdn_url if @alt_container_name
+          @@alt_ssl_url           = alt_cloudfiles_container.cdn_ssl_url if @alt_container_name
+          @use_ssl                = @options[:ssl] || false
+          @path_filename          = ":cf_path_filename" unless @url.to_s.match(/^:cf.*filename$/)
+          @url                    = ":cf_url" + "/#{URI.encode(@path_filename).gsub(/&/,'%26')}"
+          @path = (Paperclip::Attachment.default_options[:path] == @options[:path]) ? ":attachment/:id/:style/:basename.:extension" : @options[:path]
         end
 
-        Paperclip.interpolates(:s3_path_url) do |attachment, style|
-          # if @testing and alt_exists?(style)
-          if !attachment.testing or !attachment.alt_exists?(style)
-            "#{attachment.s3_protocol}://s3.amazonaws.com/#{attachment.bucket_name}/#{attachment.path(style).gsub(%r{^/}, "")}"
-          else
-            "#{attachment.s3_protocol}://s3.amazonaws.com/#{attachment.alt_bucket_name}/#{attachment.path(style).gsub(%r{^/}, "")}"
-          end
+        Paperclip.interpolates(:cf_path_filename) do |attachment, style|
+          URI.encode(attachment.path(style))
         end
 
-        Paperclip.interpolates(:s3_domain_url) do |attachment, style|
-          if !attachment.testing or !attachment.alt_exists?(style)
-            "#{attachment.s3_protocol}://#{attachment.bucket_name}.s3.amazonaws.com/#{attachment.path(style).gsub(%r{^/}, "")}"
+        Paperclip.interpolates(:cf_url) do |attachment, style|
+          if attachment.testing && !attachment.exists?(style)
+            (@use_ssl == true ? @@alt_ssl_url : @@alt_url)
           else
-            "#{attachment.s3_protocol}://#{attachment.alt_bucket_name}.s3.amazonaws.com/#{attachment.path(style).gsub(%r{^/}, "")}"
+            (@use_ssl == true ? @@ssl_url : @@cdn_url)
           end
         end
       end
 
-      def alt_bucket_name
-        @bucket_alt
+      def create_alt_container
+        container = cloudfiles.create_container(@alt_container_name)
+        container.make_public
+        container
+      end
+
+      def alt_container_name
+        @alt_container_name
+      end
+
+      def alt_cloudfiles_container
+        @@container[@alt_container_name] ||= create_alt_container
       end
 
       def testing
@@ -57,23 +60,21 @@ module Paperclip
       end
 
       def alt_exists?(style = default_style)
-        if original_filename
-          AWS::S3::S3Object.exists?(path(style), alt_bucket_name)
-        else
-          false
-        end
+        alt_cloudfiles_container.object_exists?(path(style))
       end
 
       # Returns representation of the data of the file assigned to the given
       # style, in the format most representative of the current storage.
       def to_file style = default_style
         return @queued_for_write[style] if @queued_for_write[style]
+        filename = path(style)
+        extname = File.extname(filename)
+        basename = File.basename([basename, extname])
+        file = Tempfile.new([basename, extname])
+        file.binmode
         file = Tempfile.new(path(style))
-        if !testing or !alt_exists?(style)
-          file.write(AWS::S3::S3Object.value(path(style), bucket_name))
-        else
-          file.write(AWS::S3::S3Object.value(path(style), alt_bucket_name))
-        end
+        container = (testing && !exists?(style)) ? alt_cloudfiles_container : cloudfiles_container
+        file.write(container.object(path(style)).data)
         file.rewind
         return file
       end
